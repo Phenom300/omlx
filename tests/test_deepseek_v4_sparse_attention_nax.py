@@ -33,8 +33,11 @@ pytestmark = pytest.mark.skipif(not _nax_hardware(), reason="needs M5 tensor uni
 
 @pytest.fixture
 def nax(monkeypatch):
-    monkeypatch.setattr(wsdpa, "_ENABLED", True)
-    monkeypatch.setattr(wsdpa, "_TOPK_ENABLED", True)
+    # Upstream #4396 removed the OMLX_DSV4_WSDPA env switches and their
+    # module flags; only reset what the module still has.
+    for flag in ("_ENABLED", "_TOPK_ENABLED"):
+        if hasattr(wsdpa, flag):
+            monkeypatch.setattr(wsdpa, flag, True)
     monkeypatch.setattr(wsdpa, "_broken", False)
 
     def set_enabled(enabled: bool, min_rows: int | None = None):
