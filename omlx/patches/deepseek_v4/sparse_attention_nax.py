@@ -24,7 +24,6 @@ break-at-first-invisible rule. Opt in with ``OMLX_DSV4_SPARSE_ATTENTION_NAX=1``.
 from __future__ import annotations
 
 import logging
-import os
 from functools import lru_cache
 from typing import Optional
 
@@ -32,13 +31,24 @@ import mlx.core as mx
 
 logger = logging.getLogger(__name__)
 
-_ENV = os.environ.get("OMLX_DSV4_SPARSE_ATTENTION_NAX", "0").strip().lower()
-_ENABLED = _ENV in {"1", "true", "on"}
+# Set from ``ModelSettings.deepseek_v4_sparse_attention_nax`` at model load
+# (``configure``); off by default.
+_ENABLED = False
 
 _D = 512
 _HEADS_PER_GROUP = 32
 # Short verify blocks stay on the native kernel.
-MIN_ROWS = int(os.environ.get("OMLX_DSV4_SPARSE_ATTENTION_NAX_MIN_ROWS", "16"))
+MIN_ROWS = 16
+
+
+def configure(enabled: bool, min_rows: int | None = None) -> None:
+    """Enable or disable the kernel for this process (called at model load)."""
+    global _ENABLED, MIN_ROWS, _BROKEN
+    _ENABLED = bool(enabled)
+    if min_rows is not None:
+        MIN_ROWS = int(min_rows)
+    _BROKEN = False
+    nax_sparse_attention_available.cache_clear()
 
 _COUNTS = {"nax": 0}
 _BROKEN = False
