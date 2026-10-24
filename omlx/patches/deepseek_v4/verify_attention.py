@@ -19,14 +19,54 @@ from typing import Sequence
 import mlx.core as mx
 
 
+_ROWWISE_KERNEL_EXACT: bool | None = None
+
+
+def _rowwise_fallback(lhs: mx.array, rhs: mx.array, transpose_rhs: bool) -> mx.array:
+    return mx.concatenate(
+        [
+            lhs[idx : idx + 1]
+            @ (
+                rhs[idx : idx + 1].swapaxes(-1, -2)
+                if transpose_rhs
+                else rhs[idx : idx + 1]
+            )
+            for idx in range(lhs.shape[0])
+        ]
+    )
+
+
+def _rowwise_kernel_is_exact(fast) -> bool:
+    """Probe once whether the packed kernel reproduces MLX's one-row matmul bitwise.
+
+    The verify path promises decode-exact rows. On some GPUs (seen on the
+    80-core M5 Ultra, ``applegpu_g17d``) the Steel grid kernel and the stock
+    one-row matmul pick different reduction orders and differ by one bf16
+    ulp in ~0.1-0.4 % of elements; there the fallback is the exact path.
+    """
+    global _ROWWISE_KERNEL_EXACT
+    if _ROWWISE_KERNEL_EXACT is None:
+        try:
+            state = mx.random.key(811)
+            k1, k2 = mx.random.split(state)
+            lhs = mx.random.normal((3, 64, 512), key=k1).astype(mx.bfloat16)
+            rhs = mx.random.normal((3, 156, 512), key=k2).astype(mx.bfloat16)
+            expected = _rowwise_fallback(lhs, rhs, True)
+            got = fast.rowwise_gemm(mx.contiguous(lhs), mx.contiguous(rhs), True)
+            _ROWWISE_KERNEL_EXACT = bool(mx.array_equal(expected, got).item())
+        except Exception:
+            _ROWWISE_KERNEL_EXACT = False
+    return _ROWWISE_KERNEL_EXACT
+
+
 def rowwise_gemm(lhs: mx.array, rhs: mx.array, transpose_rhs: bool) -> mx.array:
-    """Dispatch independent M=64 Steel GEMMs in one grid when available."""
+    """Dispatch independent M=64 Steel GEMMs in one grid when that is bit-exact."""
     try:
         architecture = str(mx.device_info().get("architecture", ""))
         if architecture.endswith(("d", "g", "p")):
             from omlx.custom_kernels.attention import fast
 
-            if fast.has_symbol("rowwise_gemm"):
+            if fast.has_symbol("rowwise_gemm") and _rowwise_kernel_is_exact(fast):
                 return fast.rowwise_gemm(
                     mx.contiguous(lhs),
                     mx.contiguous(rhs),

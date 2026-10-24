@@ -919,3 +919,46 @@ def test_vectorized_verify_ring_rollback_matches_accepted_prefix(dsv4, batch_cac
     if batch_cache:
         assert mx.array_equal(actual.offset, expected.offset).item()
         assert mx.array_equal(actual.left_padding, expected.left_padding).item()
+
+
+def test_exact_verify_host_covers_lightning_deepseek_v4(dsv4):
+    """A Lightning MTP head on deepseek_v4 must verify with the decode-exact kernels,
+    not only an embedded DSpark host; models of other families stay on the stock path."""
+    from omlx.patches.mlx_lm_mtp import batch_generator as bg
+
+    Host = type("Host", (), {})
+    Host.__module__ = dsv4.__name__  # module ships set_dspark_verify_armed
+    lightning = Host()
+    lightning._omlx_mtp_decode_enabled = True
+    assert bg._exact_verify_host(lightning) is lightning
+
+    off = Host()
+    off._omlx_mtp_decode_enabled = False
+    assert bg._exact_verify_host(off) is None
+
+    dspark = Host()
+    dspark._omlx_dspark_decode_enabled = True
+    assert bg._exact_verify_host(dspark) is dspark
+
+    class Other:  # this test module has no set_dspark_verify_armed
+        _omlx_mtp_decode_enabled = True
+
+    assert bg._exact_verify_host(Other()) is None
+
+    wrapper = type("Wrapper", (), {})()
+    wrapper.language_model = lightning
+    assert bg._exact_verify_host(wrapper) is lightning
+
+
+def test_rowwise_gemm_is_bitwise_equal_to_single_row_matmul(dsv4):
+    """Whatever kernel rowwise_gemm picks, its rows must equal MLX's one-row matmul bitwise."""
+    from omlx.patches.deepseek_v4 import verify_attention as va
+
+    for rows, keys in ((2, 156), (3, 1024), (6, 640)):
+        mx.random.seed(900 + rows + keys)
+        lhs = mx.random.normal((rows, 64, 512)).astype(mx.bfloat16)
+        rhs = mx.random.normal((rows, keys, 512)).astype(mx.bfloat16)
+        got = va.rowwise_gemm(lhs, rhs, True)
+        want = va._rowwise_fallback(lhs, rhs, True)
+        mx.eval(got, want)
+        assert mx.array_equal(got, want).item(), (rows, keys)
