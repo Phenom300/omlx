@@ -125,6 +125,46 @@ def _lightning_decode_consistent(config: Any) -> bool:
     return bool(is_mtp_active())
 
 
+def _local_padding_free(local_cache: Any) -> bool:
+    """Whether a single-row local ring holds no left padding from an earlier shared batch.
+
+    The decode-consistent one-row and verify paths attend every slot of the local ring (they take no mask), which is
+    only correct when the ring holds this request's keys alone. A ``BatchRotatingKVCache`` left with one row after
+    ``filter`` keeps that row's left padding until the window has been overwritten (at most ``sliding_window``
+    tokens); until then the masked stock path must be used. Padding only shrinks between ``filter``/``extend`` calls,
+    so a clean answer is memoised on the cache and the wrappers below clear it when the batch changes.
+    """
+    if local_cache is None:
+        return True
+    left_padding = getattr(local_cache, "left_padding", None)
+    if not isinstance(left_padding, mx.array):
+        return True
+    if getattr(local_cache, "_omlx_padding_free", False):
+        return True
+    free = bool(mx.all(left_padding <= 0).item())
+    local_cache._omlx_padding_free = free
+    return free
+
+
+def _track_batch_rotating_padding() -> None:
+    from mlx_lm.models.cache import BatchRotatingKVCache
+
+    if getattr(BatchRotatingKVCache, "_omlx_padding_tracked", False):
+        return
+    for name in ("filter", "extend"):
+        original = getattr(BatchRotatingKVCache, name)
+
+        def wrapped(self, *args, _original=original, **kwargs):
+            self._omlx_padding_free = False
+            return _original(self, *args, **kwargs)
+
+        setattr(BatchRotatingKVCache, name, wrapped)
+    BatchRotatingKVCache._omlx_padding_tracked = True
+
+
+_track_batch_rotating_padding()
+
+
 def _is_dspark_model(config: Any) -> bool:
     return bool(
         int(getattr(config, "dspark_block_size", 0) or 0)
@@ -1680,7 +1720,7 @@ class LocalAttention(nn.Module):
         kv = self.kv_norm(self.wkv(x)).reshape(B, 1, L, self.head_dim)
         kv = self.rope(kv, offset)
         sinks = self.attn_sink.astype(q.dtype)
-        if is_dspark_verify_armed() and B == 1 and 1 < L <= 6:
+        if is_dspark_verify_armed() and B == 1 and 1 < L <= 6 and _local_padding_free(cache):
             key_rows = _consume_rotating_verify_rows(cache, kv)
             out = _batched_m1_attention(q, key_rows, self.scale, sinks)
             out = _project_attention_output(self, out, offset)
@@ -1690,7 +1730,7 @@ class LocalAttention(nn.Module):
         if cache is not None:
             kv, _ = cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
 
-        if self.decode_consistent and B == 1 and L == 1:
+        if self.decode_consistent and B == 1 and L == 1 and _local_padding_free(cache):
             out = exact_attention(q, [kv], self.scale, sinks)
         else:
             out = None
@@ -1793,7 +1833,7 @@ class CompressedAttention(nn.Module):
         kv = self.kv_norm(self.wkv(x)).reshape(B, 1, L, self.head_dim)
         kv = self.rope(kv, offset)
         sinks = self.attn_sink.astype(q.dtype)
-        if is_dspark_verify_armed() and B == 1 and 1 < L <= 6:
+        if is_dspark_verify_armed() and B == 1 and 1 < L <= 6 and _local_padding_free(local_cache):
             compressed_kv, compressed_gate = self.compressor.project(x)
             pooled_rows = _consume_verify_rows(
                 self.compressor,
@@ -1846,7 +1886,7 @@ class CompressedAttention(nn.Module):
             and _standard_mask
             and pooled.shape[1] > 0
             and L > 4
-            and not (self.decode_consistent and B == 1 and L == 1)
+            and not (self.decode_consistent and B == 1 and L == 1 and _local_padding_free(local_cache))
             and _native_sparse_attention_available()
         ):
             pooled_indices = mx.broadcast_to(
@@ -1873,7 +1913,7 @@ class CompressedAttention(nn.Module):
             if pooled.shape[1] > 0:
                 kv = mx.concatenate([kv, pooled[:, None]], axis=2)
             mask = _extend_mask(mask, pooled_mask, kv.shape[2])
-            if self.decode_consistent and B == 1 and L == 1:
+            if self.decode_consistent and B == 1 and L == 1 and _local_padding_free(local_cache):
                 out = exact_attention(q, [kv], self.scale, sinks)
             else:
                 out = scaled_dot_product_attention(
@@ -1964,7 +2004,7 @@ class SparseCompressedAttention(nn.Module):
         kv = self.kv_norm(self.wkv(x)).reshape(B, 1, L, self.head_dim)
         kv = self.rope(kv, offset)
         sinks = self.attn_sink.astype(q.dtype)
-        if is_dspark_verify_armed() and B == 1 and L <= 6:
+        if is_dspark_verify_armed() and B == 1 and L <= 6 and _local_padding_free(local_cache):
             compressed_kv, compressed_gate = self.compressor.project(x)
             index_kv, index_gate = self.indexer.compressor.project(x)
             pooled_rows = _consume_verify_rows(
@@ -2103,7 +2143,7 @@ class SparseCompressedAttention(nn.Module):
             )[:, None]
 
         if pooled.shape[1] == 0:
-            if self.decode_consistent and B == 1 and L == 1:
+            if self.decode_consistent and B == 1 and L == 1 and _local_padding_free(local_cache):
                 out = exact_attention(q, [kv], self.scale, sinks)
             else:
                 out = None
@@ -2129,7 +2169,7 @@ class SparseCompressedAttention(nn.Module):
                         sinks=sinks,
                     )
         elif pooled.shape[1] <= self.indexer.index_topk:
-            if self.decode_consistent and B == 1 and L == 1:
+            if self.decode_consistent and B == 1 and L == 1 and _local_padding_free(local_cache):
                 full_kv = mx.concatenate([kv, pooled[:, None]], axis=2)
                 out = exact_attention(q, [full_kv], self.scale, sinks)
             else:
