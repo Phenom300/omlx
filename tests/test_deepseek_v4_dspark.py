@@ -559,8 +559,10 @@ def test_dspark_attention_kernel_matches_its_decode_path(head_dim, rows):
 
 @pytest.mark.parametrize("rows", [2, 3, 5, 6])
 def test_dspark_ring_gemm_matches_materialized_decode_rows(rows):
+    """The gated ring GEMM (packed kernel where it is bit-exact, materialized rowwise
+    path elsewhere) must equal the exact materialized decode rows bitwise."""
     from omlx.custom_kernels.attention import fast
-    from omlx.patches.deepseek_v4.verify_attention import rowwise_gemm
+    from omlx.patches.deepseek_v4.verify_attention import ring_gemm, rowwise_gemm
 
     if not fast.has_symbol("ring_gemm"):
         pytest.skip("native DSpark physical-ring GEMM is unavailable")
@@ -578,11 +580,11 @@ def test_dspark_ring_gemm_matches_materialized_decode_rows(rows):
 
     queries = mx.random.normal((rows, 64, 512), dtype=mx.bfloat16)
     expected_scores = rowwise_gemm(queries, gathered, True)
-    actual_scores = fast.ring_gemm(queries, source, indices, True)
+    actual_scores = ring_gemm(queries, source, indices, True)
 
     weights = mx.random.normal((rows, 64, 128), dtype=mx.bfloat16)
     expected_values = rowwise_gemm(weights, gathered, False)
-    actual_values = fast.ring_gemm(weights, source, indices, False)
+    actual_values = ring_gemm(weights, source, indices, False)
     mx.eval(expected_scores, actual_scores, expected_values, actual_values)
 
     assert mx.array_equal(actual_scores, expected_scores).item()
@@ -962,3 +964,28 @@ def test_rowwise_gemm_is_bitwise_equal_to_single_row_matmul(dsv4):
         want = va._rowwise_fallback(lhs, rhs, True)
         mx.eval(got, want)
         assert mx.array_equal(got, want).item(), (rows, keys)
+
+
+def test_lightning_hosts_get_decode_consistent_attention(dsv4, monkeypatch):
+    """A Lightning MTP load (MTP active, nextn head declared, not DSpark) marks every
+    attention module decode-consistent, so one-row decode and the exact verify agree."""
+    from omlx.patches import mlx_lm_mtp
+
+    config = dsv4.ModelArgs.from_dict({
+        "model_type": "deepseek_v4", "hidden_size": 256, "num_hidden_layers": 2,
+        "num_attention_heads": 4, "num_key_value_heads": 1, "head_dim": 64,
+        "vocab_size": 512, "n_routed_experts": 4, "num_experts_per_tok": 2,
+        "moe_intermediate_size": 64, "compress_ratios": [0, 4], "num_nextn_predict_layers": 1,
+    })
+    assert not dsv4._is_dspark_model(config)
+    monkeypatch.setattr(mlx_lm_mtp, "_MTP_ACTIVE", False)
+    assert dsv4._lightning_decode_consistent(config) is False
+    monkeypatch.setattr(mlx_lm_mtp, "_MTP_ACTIVE", True)
+    assert dsv4._lightning_decode_consistent(config) is True
+    attn = dsv4.LocalAttention(config, 0)
+    assert attn.decode_consistent is True and attn.dspark is False
+    monkeypatch.setattr(dsv4, "_LIGHTNING_DECODE_CONSISTENT", False)
+    assert dsv4.LocalAttention(config, 0).decode_consistent is False
+    no_head = dsv4.ModelArgs.from_dict({**config.__dict__, "num_nextn_predict_layers": 0})
+    monkeypatch.setattr(dsv4, "_LIGHTNING_DECODE_CONSISTENT", True)
+    assert dsv4._lightning_decode_consistent(no_head) is False
