@@ -60,6 +60,8 @@ def _model(dsv4, decode_consistent: bool):
     model = dsv4.Model(config)
     # random init is tiny-magnitude; scale it up so attention is not trivially uniform
     model.update(tree_map(lambda p: p * 4 if p.dtype in (mx.float32, mx.bfloat16) and p.ndim > 1 else p, model.parameters()))
+    # run in bfloat16 like the real checkpoint: the exact kernels' bitwise contract is a bf16 one
+    model.set_dtype(mx.bfloat16)
     mx.eval(model.parameters())
     for layer in model.model.layers if hasattr(model, "model") else model.layers:
         layer.attn.decode_consistent = decode_consistent
@@ -125,3 +127,35 @@ def test_short_request_after_long_one_leaves_batch(dsv4, short_len, decode_consi
     # rounding between batched and unbatched kernels is allowed; attending to padding is not
     assert worst <= 1e-2 * scale, f"short request drifted after the long one left: max |dlogit| {worst:.4f} (scale {scale:.3f})"
     assert argmax_ok
+
+
+def _batched_short_logits(model, short, forced, steps_together):
+    long_cache, _ = _prefill(model, LONG)
+    short_cache, _ = _prefill(model, short)
+    batch = _merge([long_cache, short_cache])
+    long_forced = [(i * 17 + 2) % 64 for i in range(steps_together)]
+    got = []
+    for step in range(steps_together):
+        out = model(mx.array([[long_forced[step]], [forced[step]]]), cache=batch)[:, -1]
+        mx.eval(out)
+        got.append(out[1])
+    for layer_cache in batch:
+        layer_cache.filter([1])
+    for tok in forced[steps_together:]:
+        out = model(mx.array([[tok]]), cache=batch)[:, -1]
+        mx.eval(out)
+        got.append(out[0])
+    return got
+
+
+@pytest.mark.parametrize("short_len", [5, 140])
+def test_exact_path_is_bitwise_equal_to_stock_after_the_long_request_leaves(dsv4, short_len):
+    """MTP on (decode-consistent exact path) must reproduce MTP off (stock path) bit for bit in the batch scenario:
+    while padding remains both take the masked stock path; once it is gone the mask is dropped and the exact path
+    matches the unmasked stock kernel."""
+    short = [(i * 11 + 5) % 64 for i in range(short_len)]
+    forced = [(i * 13 + 1) % 64 for i in range(3 + 20)]
+    stock = _batched_short_logits(_model(dsv4, False), short, forced, 3)
+    exact = _batched_short_logits(_model(dsv4, True), short, forced, 3)
+    differing = [i for i, (a, b) in enumerate(zip(stock, exact)) if not mx.array_equal(a, b).item()]
+    assert not differing, f"exact path differs from stock at steps {differing}"

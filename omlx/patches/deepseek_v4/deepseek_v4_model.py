@@ -146,6 +146,21 @@ def _local_padding_free(local_cache: Any) -> bool:
     return free
 
 
+def _single_row_decode_mask(mask: Optional[mx.array], local_cache: Any, B: int, L: int) -> Optional[mx.array]:
+    """Drop the local mask for one-row decode on a padding-free single-row batch cache.
+
+    ``BatchRotatingKVCache.make_mask`` returns an array even when every slot is valid. Once the row holds no padding
+    that mask is all true, but passing it still selects the masked attention kernel, which rounds differently from
+    the unmasked one the decode-consistent exact path reproduces. Returning ``None`` keeps a request that went through
+    a batch on the same arithmetic as one that never did, with MTP on or off.
+    """
+    if mask is None or B != 1 or L != 1 or local_cache is None:
+        return mask
+    if not isinstance(getattr(local_cache, "left_padding", None), mx.array):
+        return mask
+    return None if _local_padding_free(local_cache) else mask
+
+
 def _track_batch_rotating_padding() -> None:
     from mlx_lm.models.cache import BatchRotatingKVCache
 
@@ -857,7 +872,10 @@ def _sparse_pooled_attention(
     )
 
     q_scaled = q * scale
-    exact_local = decode_consistent and L == 1 and 1 <= B <= 6
+    # Batched one-row queries take the exact rows only for a single request or an armed verify batch (DSpark lays its
+    # verify rows out as B <= 6 one-row queries). Ordinary batched decode stays on the stock kernels, so a Lightning
+    # load decodes a shared batch exactly like an MTP-off load.
+    exact_local = decode_consistent and L == 1 and (B == 1 or (is_dspark_verify_armed() and B <= 6))
     pooled_sq = pooled.squeeze(1)
     if exact_local and local_mask is None and pooled_mask is None and sinks is not None:
         return _dspark_sparse_exact_attention(
@@ -882,7 +900,7 @@ def _sparse_pooled_attention(
     normalizer = mx.logsumexp(local_scores, -1, keepdims=True)
 
     q_bl = q_scaled.transpose(0, 2, 1, 3)
-    if decode_consistent and L == 1:
+    if exact_local:
         pooled_scores = _dspark_rowwise_mm(q_bl, pooled_sq, True)
     else:
         pooled_scores = q_bl @ pooled_sq.swapaxes(-1, -2)
@@ -908,7 +926,7 @@ def _sparse_pooled_attention(
     else:
         out = local_weights @ local_kv
     pw_bl = pooled_weights.transpose(0, 2, 1, 3)
-    if decode_consistent and L == 1:
+    if exact_local:
         pooled_out = _dspark_rowwise_mm(pw_bl, pooled_sq, False)
     else:
         pooled_out = pw_bl @ pooled_sq
@@ -1720,6 +1738,7 @@ class LocalAttention(nn.Module):
         kv = self.kv_norm(self.wkv(x)).reshape(B, 1, L, self.head_dim)
         kv = self.rope(kv, offset)
         sinks = self.attn_sink.astype(q.dtype)
+        mask = _single_row_decode_mask(mask, cache, B, L)
         if is_dspark_verify_armed() and B == 1 and 1 < L <= 6 and _local_padding_free(cache):
             key_rows = _consume_rotating_verify_rows(cache, kv)
             out = _batched_m1_attention(q, key_rows, self.scale, sinks)
@@ -1833,6 +1852,7 @@ class CompressedAttention(nn.Module):
         kv = self.kv_norm(self.wkv(x)).reshape(B, 1, L, self.head_dim)
         kv = self.rope(kv, offset)
         sinks = self.attn_sink.astype(q.dtype)
+        mask = _single_row_decode_mask(mask, local_cache, B, L)
         if is_dspark_verify_armed() and B == 1 and 1 < L <= 6 and _local_padding_free(local_cache):
             compressed_kv, compressed_gate = self.compressor.project(x)
             pooled_rows = _consume_verify_rows(
@@ -2004,6 +2024,7 @@ class SparseCompressedAttention(nn.Module):
         kv = self.kv_norm(self.wkv(x)).reshape(B, 1, L, self.head_dim)
         kv = self.rope(kv, offset)
         sinks = self.attn_sink.astype(q.dtype)
+        mask = _single_row_decode_mask(mask, local_cache, B, L)
         if is_dspark_verify_armed() and B == 1 and L <= 6 and _local_padding_free(local_cache):
             compressed_kv, compressed_gate = self.compressor.project(x)
             index_kv, index_gate = self.indexer.compressor.project(x)
