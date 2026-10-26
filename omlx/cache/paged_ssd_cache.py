@@ -396,6 +396,9 @@ def numerics_revision_for_model(model: Any) -> str | None:
     }
     if yarn := _yarn_revision(modules):
         revisions.add(yarn)
+    # Set by cast_bf16_params_to_fp16: KV computed before the recast is bf16.
+    if any(getattr(module, "_omlx_fp16_recast", False) for module in modules):
+        revisions.add("fp16-recast")
     return ",".join(sorted(revisions)) or None
 
 
@@ -5502,11 +5505,10 @@ class PagedSSDCacheManager(CacheManager):
                         f"{len(entries_to_flush) - flushed - failed} remaining)"
                     )
                     break
-                blk_meta = entry.get("block_metadata")
                 if not entry.get("dirty", True):
                     continue
-                if blk_meta and blk_meta.file_path.exists():
-                    continue
+                # A file at the same hash may contain an older, incompatible
+                # payload. Only the dirty flag proves this entry is persisted.
                 if self._enqueue_ssd_write(block_hash, entry, blocking=True):
                     flushed += 1
                 else:

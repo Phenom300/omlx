@@ -115,21 +115,44 @@ def ring_gemm(lhs: mx.array, source: mx.array, indices: mx.array, transpose_rhs:
     return rowwise_gemm(lhs, mx.take(source, indices, axis=0), transpose_rhs)
 
 
-def rowwise_gemm(lhs: mx.array, rhs: mx.array, transpose_rhs: bool) -> mx.array:
-    """Dispatch independent M=64 Steel GEMMs in one grid when that is bit-exact."""
+def steel_rowwise_available() -> bool:
+    """True when the native Steel rowwise GEMM is bitwise-safe here.
+
+    The Steel rowwise kernel reproduces stock ``@`` bits on the GPU
+    generations the suffix gate names (``d``/``g``/``p``), but not on
+    newer matrix-math routes (e.g. applegpu_g17s, where MLX bf16 matmul
+    accumulates in a different order).  Every kernel that promises bitwise
+    parity with the materialized rowwise path — the DSpark ring GEMM
+    included — must stay off wherever this returns False, or verify rows
+    drift from decode bits by one ULP. A one-time probe also checks the bits,
+    since the 80-core M5 Ultra (applegpu_g17d) passes the suffix gate but
+    not the probe.
+    """
     try:
         architecture = str(mx.device_info().get("architecture", ""))
-        if architecture.endswith(("d", "g", "p")):
-            from omlx.custom_kernels.attention import fast
+        if not architecture.endswith(("d", "g", "p")):
+            return False
+        from omlx.custom_kernels.attention import fast
 
-            if fast.has_symbol("rowwise_gemm") and _rowwise_kernel_is_exact(fast):
-                return fast.rowwise_gemm(
-                    mx.contiguous(lhs),
-                    mx.contiguous(rhs),
-                    transpose_rhs,
-                )
+        return fast.has_symbol("rowwise_gemm") and _rowwise_kernel_is_exact(fast)
     except Exception:
-        pass
+        return False
+
+
+def rowwise_gemm(lhs: mx.array, rhs: mx.array, transpose_rhs: bool) -> mx.array:
+    """Dispatch independent M=64 Steel GEMMs in one grid when available."""
+    if steel_rowwise_available():
+        from omlx.custom_kernels.attention import fast
+
+        # The native kernel rejects other layouts, such as TP-sharded heads.
+        try:
+            return fast.rowwise_gemm(
+                mx.contiguous(lhs),
+                mx.contiguous(rhs),
+                transpose_rhs,
+            )
+        except Exception:
+            pass
     return mx.concatenate(
         [
             lhs[idx : idx + 1]

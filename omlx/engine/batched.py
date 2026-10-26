@@ -343,6 +343,7 @@ class BatchedEngine(BaseEngine):
 
         # Apply post-load transforms (e.g., IndexCache for DSA models)
         from ..utils.model_loading import (
+            apply_activation_fp16,
             apply_post_load_transforms,
             materialize_lazy_state,
         )
@@ -408,6 +409,12 @@ class BatchedEngine(BaseEngine):
         # inference threads can read them (#1304).
         await loop.run_in_executor(
             get_mlx_executor(), materialize_lazy_state, self._model
+        )
+        await loop.run_in_executor(
+            get_mlx_executor(),
+            apply_activation_fp16,
+            self._model,
+            self._model_settings,
         )
 
         # Supported MoE gate+up regroup: concatenate the routed experts'
@@ -807,7 +814,14 @@ class BatchedEngine(BaseEngine):
                         get_mlx_executor(), _load_draft
                     )
                     self._engine.engine.scheduler.set_specprefill_draft_model(
-                        draft_model, draft_model_name=specprefill_draft
+                        draft_model,
+                        draft_model_name=specprefill_draft,
+                        keep_pct=getattr(
+                            self._model_settings, "specprefill_keep_pct", None
+                        ),
+                        threshold=getattr(
+                            self._model_settings, "specprefill_threshold", None
+                        ),
                     )
                     logger.info(
                         f"SpecPrefill: draft model loaded ({specprefill_draft})"

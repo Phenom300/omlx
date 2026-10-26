@@ -562,10 +562,19 @@ def test_dspark_ring_gemm_matches_materialized_decode_rows(rows):
     """The gated ring GEMM (packed kernel where it is bit-exact, materialized rowwise
     path elsewhere) must equal the exact materialized decode rows bitwise."""
     from omlx.custom_kernels.attention import fast
-    from omlx.patches.deepseek_v4.verify_attention import ring_gemm, rowwise_gemm
+    from omlx.patches.deepseek_v4.verify_attention import (
+        ring_gemm,
+        rowwise_gemm,
+        steel_rowwise_available,
+    )
 
     if not fast.has_symbol("ring_gemm"):
         pytest.skip("native DSpark physical-ring GEMM is unavailable")
+    if not steel_rowwise_available():
+        pytest.skip(
+            "this GPU's stock matmul does not match the Steel rowwise bits, "
+            "so the production ring route is gated off here"
+        )
 
     mx.random.seed(83 + rows)
     source = mx.random.normal((128 + rows, 512), dtype=mx.bfloat16)
@@ -594,9 +603,15 @@ def test_dspark_ring_gemm_matches_materialized_decode_rows(rows):
 @pytest.mark.parametrize("rows", [2, 3, 5])
 def test_dspark_ring_sparse_attention_matches_materialized_path(dsv4, rows):
     from omlx.custom_kernels.attention import fast
+    from omlx.patches.deepseek_v4.verify_attention import steel_rowwise_available
 
     if not fast.has_symbol("ring_gemm"):
         pytest.skip("native DSpark physical-ring GEMM is unavailable")
+    if not steel_rowwise_available():
+        pytest.skip(
+            "this GPU's stock matmul does not match the Steel rowwise bits, "
+            "so the production ring route is gated off here"
+        )
 
     mx.random.seed(109 + rows)
     source = mx.random.normal((128 + rows, 512), dtype=mx.bfloat16)

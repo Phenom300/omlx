@@ -4645,6 +4645,80 @@ def _adapter(language):
     return VLMModelAdapter(SimpleNamespace(language_model=language))
 
 
+@pytest.mark.parametrize("compact", [False, True], ids=["batch-cache", "compact-cache"])
+@pytest.mark.parametrize("delta", [0.0, 7.0, -3.0])
+def test_singleton_mtp_rebinds_positions_after_prefill_clear(
+    monkeypatch, compact, delta
+):
+    from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
+
+    active = mlx_lm_mtp.is_mtp_active()
+    mlx_lm_mtp.set_mtp_active(True)
+    bg.apply()
+    cache_rollback.apply()
+    monkeypatch.setattr(bg, "_batch_policy_for_next", lambda batch: None)
+    mx.random.seed(861)
+    model = _model("qwen_vlm")
+    # The helper has no owner config; enable the adapter's real mRoPE path.
+    model._uses_mrope = True
+    cleared = False
+    observed = []
+    original_next = bg._mtp_next
+    original_verify = Qwen3_5BatchInvariantForward.verify
+
+    def clear_between_cycles(batch, state):
+        nonlocal cleared
+        if not cleared and not state.queue and state.stats.cycles >= 1:
+            if compact:
+                batch.prompt_cache = batch.extract_cache(0)
+            # Incoming text prefill clears this shared adapter state.
+            model.clear_vlm_position_state()
+            cleared = True
+        return original_next(batch, state)
+
+    def record_positions(verifier, language_model, inputs, **kwargs):
+        if cleared:
+            cache = kwargs["cache"][language_model.model.fa_idx]
+            offset = cache._idx if hasattr(cache, "_idx") else cache.offset
+            if isinstance(offset, mx.array):
+                offset = int(offset.reshape(-1)[0].item())
+            positions = kwargs.get("position_ids")
+            first = (
+                positions[..., 0].reshape(-1).tolist()
+                if positions is not None
+                else None
+            )
+            observed.append((int(offset + delta), first))
+        return original_verify(verifier, language_model, inputs, **kwargs)
+
+    monkeypatch.setattr(bg, "_mtp_next", clear_between_cycles)
+    monkeypatch.setattr(Qwen3_5BatchInvariantForward, "verify", record_positions)
+    generator = BatchGenerator(
+        model,
+        sampler=lambda lp: mx.argmax(lp, -1),
+        max_tokens=24,
+        prefill_batch_size=1,
+    )
+    try:
+        uid = generator.insert([list(range(3, 15))], max_tokens=[24])[0]
+        model.register_rope_delta(uid, delta)
+        for _ in range(100):
+            _, responses = generator.next()
+            if any(response.finish_reason for response in responses):
+                break
+        else:
+            pytest.fail("generation did not finish")
+    finally:
+        generator.close()
+        mlx_lm_mtp.set_mtp_active(active)
+
+    assert cleared and observed
+    assert all(
+        first and all(position == expected for position in first)
+        for expected, first in observed
+    ), observed
+
+
 def _model(family):
     if family == "qwen_vlm":
         from mlx_vlm.models.qwen3_5.config import ModelConfig, TextConfig, VisionConfig
@@ -6451,6 +6525,43 @@ def test_batch_park_expires_while_cohorts_come_and_go():
     assert first_mtp is not None and first_mtp <= 128 + 150 + 5
     assert mtp_cycles > 0.9 * (6000 - first_mtp) - 5 * 6000 / 50
 
+
+
+def test_batch_park_backoff_survives_cohort_changes():
+    """A cohort that starts after a park ended measures MTP again, and when
+    MTP loses again it parks for the doubled cooldown although the cohort that
+    lost first is gone. A cohort where MTP holds up resets the backoff."""
+    from omlx.patches.mlx_lm_mtp.batch_policy import ParkMemory
+
+    memory = ParkMemory()
+    first = BatchPolicy(range(4), 3)
+    first.park()
+    memory.parked(first)
+    for _ in range(128):
+        memory.tick()
+    later = BatchPolicy(range(4), 3)
+    memory.seed(later)
+    assert later.remaining == 0 and later.needs_standard()
+    later.park()
+    assert later.remaining == 256 and later.cooldown == 512
+    memory.parked(later)
+    for _ in range(256):
+        memory.tick()
+    wider, narrower = BatchPolicy(range(8), 3), BatchPolicy(range(2), 3)
+    memory.seed(wider)
+    memory.seed(narrower)
+    wider.park()
+    narrower.park()
+    # Only cohorts of at least the row count that lost inherit the backoff.
+    assert wider.remaining == 512 and narrower.remaining == 128
+
+    held = BatchPolicy(range(8), 3)
+    held.decisions = 32
+    memory.retired(held)
+    fresh = BatchPolicy(range(4), 3)
+    memory.seed(fresh)
+    fresh.park()
+    assert fresh.remaining == 128
 
 def test_rows_rebuilt_under_a_lowered_policy_depth_keep_tokens(monkeypatch):
     """A fallback rebuilds rows that draft deeper than the lowered policy depth."""

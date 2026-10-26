@@ -48,6 +48,9 @@ from .engine.splash import (
     splash_memory_estimate,
     splash_repo_id,
 )
+from .engine.splash import (
+    scan_ssd_cache as scan_splash_ssd_cache,
+)
 from .engine.sts import STSEngine
 from .engine.stt import STTEngine
 from .engine.tts import TTSEngine
@@ -1182,6 +1185,10 @@ class EnginePool:
         if mtp_active:
             add("mtp_adaptive_max_depth", data.get("mtp_adaptive_max_depth"))
             add("mtp_fixed_depth", data.get("mtp_fixed_depth"))
+        add(
+            "activation_fp16_enabled",
+            bool(data.get("activation_fp16_enabled", False)),
+        )
         if entry is not None:
             qwen4_offload, _, _ = self._qwen4_ple_offload_status(entry, settings)
             add("qwen4_ple_ssd_offload", qwen4_offload)
@@ -2942,6 +2949,36 @@ class EnginePool:
         task.add_done_callback(self._finish_lease_release_task)
         await asyncio.shield(task)
 
+    async def clear_splash_ssd_cache(self, cache_root: Path) -> int:
+        """Stop idle Splash writers before deleting their persistent cache."""
+        async with self._lock:
+            entries = [
+                entry
+                for entry in self._entries.values()
+                if isinstance(entry.engine, SplashEngine) and entry.engine.ssd_cache_dir
+            ]
+            for entry in entries:
+                if (
+                    entry.is_loading
+                    or entry.pending_unload_reason
+                    or not self._entry_is_quiescent(entry)
+                ):
+                    raise ModelBusyError(entry.model_id, "delete Splash SSD cache")
+            roots = {cache_root}
+            reason = "delete Splash SSD cache"
+            for entry in entries:
+                roots.add(entry.engine.ssd_cache_dir.parent)
+                # The ready-engine fast path bypasses the pool lock.
+                entry.pending_unload_reason = reason
+            try:
+                for entry in entries:
+                    await self._unload_engine(entry.model_id)
+                return sum(scan_splash_ssd_cache(root, clear=True)[0] for root in roots)
+            finally:
+                for entry in entries:
+                    if entry.pending_unload_reason == reason:
+                        entry.pending_unload_reason = None
+
     async def unload_if_idle_unpinned(self, model_id: str) -> bool:
         """Unload a loaded engine only when it is idle and not pinned."""
         async with self._lock:
@@ -3857,6 +3894,42 @@ class EnginePool:
         self._failed_load_reclaim_tasks.add(task)
         task.add_done_callback(self._finish_failed_load_reclaim_task)
 
+    @staticmethod
+    async def _start_engine(engine) -> None:
+        """Drain startup before stopping an engine whose acquisition was cancelled."""
+        if isinstance(engine, SplashEngine):
+            # Splash stops its subprocess when readiness is cancelled; do not
+            # defer that cleanup until its startup timeout expires.
+            await engine.start()
+            return
+        task = asyncio.create_task(engine.start())
+        cancelled = False
+        try:
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    cancelled = True
+        finally:
+            if cancelled:
+                # start() can own a running core while awaiting a loader thread.
+                # Keep that thread alive until startup settles, then stop the
+                # unregistered engine before _load_engine clears is_loading.
+                with suppress(Exception, asyncio.CancelledError):
+                    task.result()
+                stop_task = asyncio.create_task(engine.stop())
+                try:
+                    while not stop_task.done():
+                        with suppress(asyncio.CancelledError):
+                            await asyncio.shield(stop_task)
+                    stop_task.result()
+                except Exception:
+                    logger.warning(
+                        "Error stopping engine after cancelled startup", exc_info=True
+                    )
+                raise asyncio.CancelledError
+        task.result()
+
     async def _load_engine(
         self,
         model_id: str,
@@ -4089,7 +4162,7 @@ class EnginePool:
             if isinstance(engine, SplashEngine):
                 self._starting_external[model_id] = engine
             try:
-                await engine.start()
+                await self._start_engine(engine)
             except Exception as start_error:
                 if isinstance(engine, SplashEngine):
                     # start() already stopped Splash; its error carries the
@@ -4122,7 +4195,7 @@ class EnginePool:
                         prefill_eviction_callback=prefill_eviction_callback,
                     )
                     try:
-                        await engine.start()
+                        await self._start_engine(engine)
                     except Exception as fallback_error:
                         raise RuntimeError(
                             f"LM load failed (force_lm=True): {start_error}; "
@@ -4158,7 +4231,7 @@ class EnginePool:
                         prefill_eviction_callback=prefill_eviction_callback,
                     )
                     try:
-                        await engine.start()
+                        await self._start_engine(engine)
                     except Exception as fallback_error:
                         raise RuntimeError(
                             f"VLM load failed: {start_error}; "
@@ -4396,6 +4469,10 @@ class EnginePool:
                 f"full model: {format_size(entry.estimated_size)}, "
                 f"total: {format_size(self._current_model_memory)})"
             )
+        except asyncio.CancelledError:
+            if not load_completed:
+                self._schedule_failed_load_reclaim(model_id, pre_load_memory)
+            raise
         except Exception as exc:
             # A failed load can leave tens of GB of just-loaded weights
             # reachable only through the propagating exception's traceback
