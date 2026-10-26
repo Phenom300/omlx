@@ -642,6 +642,7 @@ def test_dspark_ring_sparse_attention_matches_materialized_path(dsv4, rows):
         scale,
         sinks,
         decode_consistent=True,
+        verify_rows=True,
     )
     actual = dsv4._sparse_pooled_ring_attention(
         q,

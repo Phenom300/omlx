@@ -746,6 +746,7 @@ def _sparse_pooled_ring_attention(
             scale,
             sinks,
             decode_consistent=True,
+            verify_rows=True,
         )
     idx = topk[:, None, :, :, None]
     pooled = mx.take_along_axis(
@@ -800,6 +801,7 @@ def _sparse_pooled_attention(
     decode_consistent: bool = False,
     native_only: bool = False,
     _standard_mask: bool = False,
+    verify_rows: bool = False,
 ) -> Optional[mx.array]:
     global _DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED
 
@@ -873,10 +875,8 @@ def _sparse_pooled_attention(
     )
 
     q_scaled = q * scale
-    # Batched one-row queries take the exact rows only for a single request or an armed verify batch (DSpark lays its
-    # verify rows out as B <= 6 one-row queries). Ordinary batched decode stays on the stock kernels, so a Lightning
-    # load decodes a shared batch exactly like an MTP-off load.
-    exact_local = decode_consistent and L == 1 and (B == 1 or (is_dspark_verify_armed() and B <= 6))
+    # Verify blocks lay their rows out as B <= 6 one-row queries. Other batched decode stays on stock kernels.
+    exact_local = decode_consistent and L == 1 and (B == 1 or (verify_rows and B <= 6))
     pooled_sq = pooled.squeeze(1)
     if exact_local and local_mask is None and pooled_mask is None and sinks is not None:
         return _dspark_sparse_exact_attention(
@@ -2136,6 +2136,7 @@ class SparseCompressedAttention(nn.Module):
                             self.scale,
                             sinks,
                             decode_consistent=self.decode_consistent,
+                            verify_rows=True,
                         )
                 finally:
                     set_dspark_verify_armed(True)
